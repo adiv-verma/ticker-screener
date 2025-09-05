@@ -11,7 +11,7 @@ st.set_page_config(page_title="US Equity Universe — FMP Screener", layout="wid
 
 # Secrets
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
-FMP_API_KEY = st.secrets.get("FMP_API_KEY", "")
+FMP_API_KEY  = st.secrets.get("FMP_API_KEY", "")
 if not APP_PASSWORD:
     st.error("APP_PASSWORD is not set in secrets.")
     st.stop()
@@ -40,8 +40,9 @@ def check_password() -> bool:
 # --------------------------------
 # Endpoints & defaults
 # --------------------------------
-SCREENER_URL = "https://financialmodelingprep.com/stable/company-screener"
-RATIOS_TTM_V3 = "https://financialmodelingprep.com/api/v3/ratios-ttm"
+SCREENER_URL   = "https://financialmodelingprep.com/stable/company-screener"
+RATIOS_TTM_V3  = "https://financialmodelingprep.com/api/v3/ratios-ttm"
+KEY_METRICS_V3 = "https://financialmodelingprep.com/stable/key-metrics"
 
 DEFAULT_MARKET_CAP = 500_000_000   # $500M
 DEFAULT_VOLUME     = 100_000       # 100k shares
@@ -52,7 +53,7 @@ DEFAULT_LIMIT      = 1000          # per exchange
 # --------------------------------
 def get_session():
     s = requests.Session()
-    s.headers.update({"User-Agent": "streamlit-fmp-screener/2.0"})
+    s.headers.update({"User-Agent": "streamlit-fmp-screener/2.1"})
     return s
 
 def get_json_with_retry(session, url: str, params: dict, retries: int = 2, timeout: int = 25):
@@ -79,9 +80,7 @@ def fetch_screener_batch(
     limit: int,
     include_all_share_classes: bool,
 ):
-    """
-    Fetch NASDAQ/NYSE in parallel; return merged, deduped DataFrame.
-    """
+    """Fetch NASDAQ/NYSE in parallel; return merged, deduped DataFrame."""
     session = get_session()
 
     def _params(exchange: str):
@@ -124,27 +123,41 @@ def fetch_screener_batch(
     return df_all
 
 # --------------------------------
-# Per-symbol ratios (reliable)
+# Per-symbol ratios + key metrics
 # --------------------------------
+def _safe_first(js):
+    return js[0] if isinstance(js, list) and js else {}
+
 def _fetch_ratios_one(sym: str, session, timeout: int = 20) -> dict:
     """
-    GET /api/v3/ratios-ttm/{symbol} and pull the 3 fields we need.
-    Returns at least {"symbol": sym} so merge is safe on errors.
+    Fetch P/E & P/B from /api/v3/ratios-ttm/{symbol}.
+    Fetch EV/EBITDA from /stable/key-metrics?symbol={symbol}.
     """
+    out = {"symbol": sym, "peRatioTTM": None, "priceToBookRatioTTM": None, "enterpriseValueOverEBITDATTM": None}
+
+    # --- P/E and P/B ---
     try:
         url = f"{RATIOS_TTM_V3}/{sym}"
         r = session.get(url, params={"apikey": FMP_API_KEY}, timeout=timeout)
         r.raise_for_status()
-        js = r.json()
-        row = js[0] if js else {}
-        return {
-            "symbol": sym,
-            "peRatioTTM": row.get("peRatioTTM"),
-            "priceToBookRatioTTM": row.get("priceToBookRatioTTM"),
-            "enterpriseValueOverEBITDATTM": row.get("enterpriseValueOverEBITDATTM"),
-        }
+        row = _safe_first(r.json())
+        out["peRatioTTM"] = row.get("peRatioTTM")
+        out["priceToBookRatioTTM"] = row.get("priceToBookRatioTTM")
     except Exception:
-        return {"symbol": sym}
+        pass
+
+    # --- EV/EBITDA ---
+    try:
+        r2 = session.get(KEY_METRICS_V3, params={"apikey": FMP_API_KEY, "symbol": sym, "limit": 1, "period": "FY"}, timeout=timeout)
+        r2.raise_for_status()
+        row2 = _safe_first(r2.json())
+        ev_ebitda = row2.get("evToEBITDA")
+        if ev_ebitda not in (None, ""):
+            out["enterpriseValueOverEBITDATTM"] = ev_ebitda
+    except Exception:
+        pass
+
+    return out
 
 def add_valuation_columns_from_symbols(
     df: pd.DataFrame,
@@ -153,9 +166,7 @@ def add_valuation_columns_from_symbols(
     sleep_secs: float = 1.0
 ) -> pd.DataFrame:
     """
-    Fetch P/E, P/B, EV/EBITDA for exactly the symbols in df using /api/v3/ratios-ttm/{symbol}.
-    - max_workers: parallel requests (tune down if you see HTTP 429)
-    - throttle_every: every N completed requests, sleep briefly to be polite
+    Fetch P/E, P/B, EV/EBITDA for exactly the symbols in df.
     """
     if df.empty or "symbol" not in df.columns:
         return df
@@ -166,7 +177,7 @@ def add_valuation_columns_from_symbols(
     symbols = df["symbol"].dropna().unique().tolist()
     results = []
 
-    progress = st.progress(0, text="Fetching valuation ratios (per symbol)…")
+    progress = st.progress(0, text="Fetching valuation ratios…")
 
     done, total = 0, len(symbols)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -177,10 +188,9 @@ def add_valuation_columns_from_symbols(
             if throttle_every and (done % throttle_every == 0):
                 time.sleep(sleep_secs)
             if done % 10 == 0 or done == total:
-                progress.progress(done / total, text=f"Fetching valuation ratios… {done}/{total}")
+                progress.progress(done / total, text=f"Valuation ratios… {done}/{total}")
 
     progress.empty()
-
     ratios_df = pd.DataFrame(results)
     merged = df.merge(ratios_df, on="symbol", how="left")
     return merged
@@ -190,7 +200,7 @@ def add_valuation_columns_from_symbols(
 # --------------------------------
 if check_password():
     st.title("US Equity Universe — FMP Stock Screener 📈")
-    st.caption("Country=US • Mkt Cap ≥ $500M • Avg Vol ≥ 100k • Exclude ETFs/Funds • Actively trading • NASDAQ + NYSE")
+    st.caption("Filters: Country=US • Market Cap ≥ $500M • Avg Vol ≥ 100k • Exclude ETFs/Funds • Actively trading • NASDAQ + NYSE")
 
     with st.sidebar:
         st.header("Filters")
@@ -206,7 +216,7 @@ if check_password():
         show_sector_summary   = st.checkbox("Show sector summary", value=True)
         show_industry_summary = st.checkbox("Show industry summary", value=False)
         show_all_columns      = st.checkbox("Show full table", value=True)
-        quick_mode            = st.checkbox("Quick mode (hide full table; summaries + download only)", value=False)
+        quick_mode            = st.checkbox("Quick mode (summaries + download only)", value=False)
 
         run_btn = st.button("Run Screener", type="primary", use_container_width=True)
 
@@ -232,14 +242,11 @@ if check_password():
             st.error("No data returned. Try lowering filters or increasing the per-exchange limit.")
             st.stop()
 
-        # 2) Valuation ratios per-symbol
+        # 2) Ratios
         t1 = time.time()
-        with st.spinner("Fetching valuation metrics (per symbol)…"):
+        with st.spinner("Fetching valuation metrics…"):
             df = add_valuation_columns_from_symbols(
-                df,
-                max_workers=8,          # tune if you see 429s
-                throttle_every=60,      # pause every N requests
-                sleep_secs=1.0
+                df, max_workers=8, throttle_every=60, sleep_secs=1.0
             )
         ratio_secs = time.time() - t1
 
@@ -256,10 +263,8 @@ if check_password():
 
         # Optional summaries
         def _fmt_money(x):
-            try:
-                return f"${x:,.0f}"
-            except Exception:
-                return x
+            try: return f"${x:,.0f}"
+            except Exception: return x
 
         if show_sector_summary and "sector" in df.columns:
             st.subheader("Sector Summary")
@@ -271,11 +276,9 @@ if check_password():
                        median_mktcap=("marketCap", "median"))
                   .sort_values("tickers", ascending=False)
             )
-            sec_display = sec.copy()
             for c in ["total_mktcap", "avg_mktcap", "median_mktcap"]:
-                if c in sec_display.columns:
-                    sec_display[c] = sec_display[c].apply(_fmt_money)
-            st.dataframe(sec_display, use_container_width=True)
+                if c in sec.columns: sec[c] = sec[c].apply(_fmt_money)
+            st.dataframe(sec, use_container_width=True)
 
         if show_industry_summary and "industry" in df.columns:
             st.subheader("Industry Summary")
@@ -286,19 +289,15 @@ if check_password():
                        avg_mktcap=("marketCap", "mean"))
                   .sort_values(["sector", "tickers"], ascending=[True, False])
             )
-            ind_display = ind.copy()
             for c in ["total_mktcap", "avg_mktcap"]:
-                if c in ind_display.columns:
-                    ind_display[c] = ind_display[c].apply(_fmt_money)
-            st.dataframe(ind_display, use_container_width=True)
+                if c in ind.columns: ind[c] = ind[c].apply(_fmt_money)
+            st.dataframe(ind, use_container_width=True)
 
         st.divider()
 
-        # Compact valuation preview
-        val_cols = [
-            "symbol", "companyName", "sector", "industry",
-            "peRatioTTM", "priceToBookRatioTTM", "enterpriseValueOverEBITDATTM"
-        ]
+        # Valuation preview
+        val_cols = ["symbol","companyName","sector","industry",
+                    "peRatioTTM","priceToBookRatioTTM","enterpriseValueOverEBITDATTM"]
         show_cols = [c for c in val_cols if c in df.columns]
         if show_cols:
             st.subheader("Valuation Columns (preview)")
