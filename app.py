@@ -35,8 +35,9 @@ if not FMP_API_KEY:
     st.error("FMP_API_KEY is not set in secrets.")
     st.stop()
 
-SCREENER_URL = "https://financialmodelingprep.com/stable/company-screener"
-RATIOS_URL   = "https://financialmodelingprep.com/stable/ratios-ttm"
+SCREENER_URL              = "https://financialmodelingprep.com/stable/company-screener"
+RATIOS_TTM_BULK_URL       = "https://financialmodelingprep.com/stable/ratios-ttm-bulk"
+KEY_METRICS_TTM_BULK_URL  = "https://financialmodelingprep.com/stable/key-metrics-ttm-bulk"
 
 DEFAULT_MARKET_CAP = 500_000_000   # 500M
 DEFAULT_VOLUME     = 100_000       # 100k
@@ -47,7 +48,7 @@ DEFAULT_LIMIT      = 1000          # per exchange
 # ---------------------------
 def get_session():
     s = requests.Session()
-    s.headers.update({"User-Agent": "streamlit-fmp-screener/1.0"})
+    s.headers.update({"User-Agent": "streamlit-fmp-screener/1.1"})
     return s
 
 def get_json_with_retry(session, url: str, params: dict, retries: int = 2, timeout: int = 25):
@@ -123,58 +124,73 @@ def fetch_screener_batch(
     return df_all
 
 # ---------------------------
-# Valuation ratios (P/E, P/B, EV/EBITDA)
+# Valuation via BULK endpoints
 # ---------------------------
-def _fetch_ratios_one(symbol: str, session, timeout: int = 20) -> dict:
+def add_valuation_columns_bulk(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fetch P/E, P/B, EV/EBITDA (TTM) for a single symbol.
-    Returns keys: symbol, peRatioTTM, priceToBookRatioTTM, enterpriseValueOverEBITDATTM
-    """
-    try:
-        r = session.get(RATIOS_URL, params={"apikey": FMP_API_KEY, "symbol": symbol}, timeout=timeout)
-        r.raise_for_status()
-        js = r.json()
-        row = js[0] if js else {}
-        return {
-            "symbol": symbol,
-            "peRatioTTM": row.get("peRatioTTM"),
-            "priceToBookRatioTTM": row.get("priceToBookRatioTTM"),
-            "enterpriseValueOverEBITDATTM": row.get("enterpriseValueOverEBITDATTM"),
-        }
-    except Exception:
-        return {"symbol": symbol}
-
-def add_valuation_columns(df: pd.DataFrame, max_workers: int = 8) -> pd.DataFrame:
-    """
-    Fetch ratios for all symbols in df (parallelized) and merge back.
-    Adds: peRatioTTM, priceToBookRatioTTM, enterpriseValueOverEBITDATTM
+    Use FMP bulk endpoints to attach P/E, P/B, EV/EBITDA to df.
+    - Ratios TTM Bulk -> priceToEarningsRatioTTM, priceToBookRatioTTM, enterpriseValueMultipleTTM (EV/EBITDA)
+    - Key Metrics TTM Bulk -> evToEBITDATTM (fallback for EV/EBITDA)
     """
     if df.empty or "symbol" not in df.columns:
         return df
 
+    symbols = set(df["symbol"].dropna().unique().tolist())
     session = requests.Session()
-    session.headers.update({"User-Agent": "streamlit-fmp-screener/ratios"})
+    session.headers.update({"User-Agent": "streamlit-fmp-screener/bulk"})
 
-    symbols = df["symbol"].dropna().unique().tolist()
-    results = []
+    # Fetch both bulks (global payloads), then filter to our symbols
+    t0 = time.time()
+    try:
+        r1 = session.get(RATIOS_TTM_BULK_URL, params={"apikey": FMP_API_KEY}, timeout=60)
+        r1.raise_for_status()
+        ratios_bulk = pd.DataFrame(r1.json())
+    except Exception:
+        ratios_bulk = pd.DataFrame(columns=[
+            "symbol", "priceToEarningsRatioTTM", "priceToBookRatioTTM", "enterpriseValueMultipleTTM"
+        ])
 
-    progress = st.progress(0, text="Fetching valuation ratios…")
+    try:
+        r2 = session.get(KEY_METRICS_TTM_BULK_URL, params={"apikey": FMP_API_KEY}, timeout=60)
+        r2.raise_for_status()
+        km_bulk = pd.DataFrame(r2.json())
+    except Exception:
+        km_bulk = pd.DataFrame(columns=["symbol", "evToEBITDATTM"])
+    t_fetch = time.time() - t0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_fetch_ratios_one, sym, session): sym for sym in symbols}
-        total = len(futures)
-        done = 0
-        for fut in as_completed(futures):
-            results.append(fut.result())
-            done += 1
-            if done % 10 == 0 or done == total:
-                progress.progress(done / total, text=f"Fetching valuation ratios… {done}/{total}")
+    # Keep only needed columns and our tickers
+    ratios_keep = ["symbol", "priceToEarningsRatioTTM", "priceToBookRatioTTM", "enterpriseValueMultipleTTM"]
+    if not ratios_bulk.empty:
+        ratios_bulk = ratios_bulk[ratios_keep]
+        ratios_bulk = ratios_bulk[ratios_bulk["symbol"].isin(symbols)]
 
-    progress.empty()
+    km_keep = ["symbol", "evToEBITDATTM"]
+    if not km_bulk.empty:
+        km_bulk = km_bulk[km_keep]
+        km_bulk = km_bulk[km_bulk["symbol"].isin(symbols)]
 
-    ratios_df = pd.DataFrame(results)
-    out = df.merge(ratios_df, on="symbol", how="left")
-    return out
+    # Merge onto df
+    merged = df.merge(ratios_bulk, on="symbol", how="left").merge(km_bulk, on="symbol", how="left")
+
+    # Coalesce EV/EBITDA: prefer enterpriseValueMultipleTTM (same thing), fallback to evToEBITDATTM
+    def _coalesce_ev_ebitda(row):
+        a = row.get("enterpriseValueMultipleTTM")
+        b = row.get("evToEBITDATTM")
+        try:
+            return float(a) if pd.notna(a) else (float(b) if pd.notna(b) else None)
+        except Exception:
+            return a if pd.notna(a) else b
+
+    merged["enterpriseValueOverEBITDATTM"] = merged.apply(_coalesce_ev_ebitda, axis=1)
+
+    # Map to final column names you want
+    merged["peRatioTTM"] = pd.to_numeric(merged.get("priceToEarningsRatioTTM"), errors="coerce")
+    merged["priceToBookRatioTTM"] = pd.to_numeric(merged.get("priceToBookRatioTTM"), errors="coerce")
+
+    # Optionally drop the raw bulk names (uncomment if you prefer a cleaner table)
+    # merged = merged.drop(columns=["priceToEarningsRatioTTM","priceToBookRatioTTM","enterpriseValueMultipleTTM","evToEBITDATTM"], errors="ignore")
+
+    return merged, t_fetch
 
 # ---------------------------
 # UI
@@ -199,7 +215,7 @@ if check_password():
         show_sector_summary   = st.checkbox("Show sector summary", value=True)
         show_industry_summary = st.checkbox("Show industry summary", value=False)
         show_all_columns      = st.checkbox("Show full table", value=True)
-        quick_mode            = st.checkbox("Quick mode (faster render: hide table, show only summaries + download)", value=False)
+        quick_mode            = st.checkbox("Quick mode (hide full table; summaries + download only)", value=False)
 
         run_btn = st.button("Run Screener", type="primary", use_container_width=True)
 
@@ -208,6 +224,7 @@ if check_password():
             st.warning("Pick at least one exchange.")
             st.stop()
 
+        # 1) Screener fetch
         t0 = time.time()
         with st.spinner("Fetching screener data from FMP…"):
             df = fetch_screener_batch(
@@ -218,16 +235,17 @@ if check_password():
                 limit=int(limit),
                 include_all_share_classes=include_all_share_classes,
             )
-        fetch_secs = time.time() - t0
+        screener_secs = time.time() - t0
 
         if df.empty:
             st.error("No data returned. Try lowering filters or increasing the per-exchange limit.")
             st.stop()
 
-        # Add valuation columns (P/E, P/B, EV/EBITDA)
+        # 2) Valuation columns via BULK endpoints
         t1 = time.time()
-        df = add_valuation_columns(df)
-        ratio_secs = time.time() - t1
+        with st.spinner("Fetching valuation metrics (bulk)…"):
+            df, bulk_secs = add_valuation_columns_bulk(df)
+        ratio_secs = time.time() - t1  # local processing; fetch time is bulk_secs
 
         # Metrics
         n = len(df)
@@ -237,7 +255,7 @@ if check_password():
         with col1: st.metric("Total tickers", n)
         with col2: st.metric("Min Market Cap", f"${min_mcap:,}")
         with col3: st.metric("Min Volume", f"{min_vol:,} shares")
-        with col4: st.metric("Timing", f"Screener {fetch_secs:.1f}s • Ratios {ratio_secs:.1f}s")
+        with col4: st.metric("Timing", f"Screener {screener_secs:.1f}s • Bulk fetch {bulk_secs:.1f}s")
 
         st.caption("Deduped by symbol • Columns shown depend on ticker; we keep them all.")
         st.divider()
@@ -305,12 +323,10 @@ if check_password():
         with st.expander("Notes"):
             st.markdown(
                 """
-- Screener endpoint: **/stable/company-screener** (filters: `country`, `exchange`, `marketCapMoreThan`, `volumeMoreThan`, `isEtf=false`, `isFund=false`, `isActivelyTrading=true`, `limit`, `includeAllShareClasses`).
-- Valuation endpoint: **/stable/ratios-ttm?symbol=...** for `peRatioTTM`, `priceToBookRatioTTM`, `enterpriseValueOverEBITDATTM`.
-- Performance tips:
-  - Reduce **Per-exchange limit** if you don’t need the full 1000.
-  - Toggle **Quick mode** to skip rendering the full table.
-  - Ratios are fetched per symbol in parallel; total time scales with the number of tickers and your FMP rate limits.
-- Numeric literals like `500_000_000` are the same as `500000000` in Python (underscores for readability).
+- Screener: **/stable/company-screener** (filters: `country`, `exchange`, `marketCapMoreThan`, `volumeMoreThan`, `isEtf=false`, `isFund=false`, `isActivelyTrading=true`, `limit`, `includeAllShareClasses`).
+- Valuation (bulk): **/stable/ratios-ttm-bulk** → `priceToEarningsRatioTTM`, `priceToBookRatioTTM`, `enterpriseValueMultipleTTM`; **/stable/key-metrics-ttm-bulk** → `evToEBITDATTM` (fallback).
+- EV/EBITDA uses `enterpriseValueMultipleTTM` primarily; falls back to `evToEBITDATTM` when needed.
+- Financials/REITs or firms with negative earnings/EBITDA may still show blanks for certain ratios.
+- Results cached for 15 minutes; reduce **Per-exchange limit** if you just want a quick run.
                 """
             )
